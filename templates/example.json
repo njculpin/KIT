@@ -1,0 +1,42 @@
+{
+    "size": { "width": 3600, "height": 4800 },
+    "background": "#FFFFFF",
+    "groups": [
+        {
+            "name": "header",
+            "layout": {
+                "type": "vertical",
+                "spacing": 20,
+                "position": {
+                    "x": 1800,
+                    "y": 50,
+                    "align": "center"
+                }
+            },
+            "layers": [
+                {
+                    "type": "text",
+                    "name": "Title",
+                    "text": "Hello Muffin",
+                    "font": { 
+                        "family": "Arial",
+                        "size": 120,
+                        "color": "#FF0000",
+                        "weight": "bold",
+                        "style": "normal",
+                        "decoration": "none"
+                    },
+                    "alignment": "center",
+                    "justification": "center"
+                },
+                {
+                    "type": "image",
+                    "name": "Logo",
+                    "source": "assets/cat.png",
+                    "scale": 1.5
+                }
+            ]
+        }
+    ]
+}
+  
