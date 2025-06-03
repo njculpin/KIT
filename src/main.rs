@@ -1,12 +1,18 @@
-use image::{Rgba, RgbaImage};
-use rusttype::{Font as RustFont, Scale};
-use serde::Deserialize;
+use std::error::Error;
 use std::fs::File;
 use std::io::Read;
+use image::{RgbaImage, Rgba};
+use serde::Deserialize;
+use rusttype::{Font as RustFont, Scale};
+use layer_trait::SourceLayer;
 use csscolorparser::parse as parse_color;
 use font_kit::source::SystemSource;
 use font_kit::properties::{Properties, Weight, Style};
 use font_kit::family_name::FamilyName;
+
+mod ai_handler;
+mod layer_trait;
+use ai_handler::AiData;
 
 #[derive(Deserialize)]
 struct Size {
@@ -51,7 +57,7 @@ fn default_relative_to() -> RelativeTo {
     RelativeTo::Canvas
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 enum FontWeight {
     Normal,
@@ -94,7 +100,7 @@ impl FontWeight {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 enum FontStyle {
     Normal,
@@ -112,7 +118,7 @@ impl FontStyle {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 enum FontDecoration {
     None,
@@ -121,7 +127,7 @@ enum FontDecoration {
     Overline,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 enum TextAlignment {
     Left,
@@ -129,7 +135,7 @@ enum TextAlignment {
     Right,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 enum TextJustification {
     Left,
@@ -138,7 +144,7 @@ enum TextJustification {
     Justify,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct FontSpec {
     family: String,
     size: f32,
@@ -260,28 +266,12 @@ enum LayoutType {
 struct GroupPosition {
     x: u32,
     y: u32,
-    #[serde(default = "default_align")]
-    align: Align,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Align {
-    Left,
-    Center,
-    Right,
-}
-
-fn default_align() -> Align {
-    Align::Left
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Distribution {
-    SpaceBetween,
-    SpaceAround,
-    SpaceEvenly,
+struct DistributionConfig {
+    #[serde(default)]
+    bounds: Option<DistributionBounds>,
 }
 
 #[derive(Deserialize)]
@@ -291,13 +281,32 @@ struct DistributionBounds {
 }
 
 #[derive(Deserialize)]
-struct DistributionConfig {
-    #[serde(default)]
-    horizontal: Option<Distribution>,
-    #[serde(default)]
-    vertical: Option<Distribution>,
-    #[serde(default)]
-    bounds: Option<DistributionBounds>,
+#[serde(rename_all = "lowercase")]
+enum GroupAlignment {
+    Left,
+    Center,
+    Right,
+    Top,
+    Bottom,
+}
+
+fn default_group_alignment() -> GroupAlignment {
+    GroupAlignment::Left
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GroupJustification {
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+fn default_group_justification() -> GroupJustification {
+    GroupJustification::Start
 }
 
 fn default_spacing() -> u32 {
@@ -315,6 +324,10 @@ struct GroupLayout {
     columns: u32,
     #[serde(default)]
     distribution: Option<DistributionConfig>,
+    #[serde(default = "default_group_alignment")]
+    alignment: GroupAlignment,
+    #[serde(default = "default_group_justification")]
+    justification: GroupJustification,
 }
 
 fn default_columns() -> u32 {
@@ -330,15 +343,30 @@ struct LayerInfo {
 
 #[derive(Deserialize)]
 struct Group {
+    #[allow(dead_code)]
     name: String,
     layout: GroupLayout,
     layers: Vec<Layer>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SourceType {
+    AI,
+}
+
+#[derive(Deserialize)]
+struct SourceFile {
+    path: String,
+    #[serde(rename = "type")]
+    file_type: SourceType,
+}
+
+#[derive(Deserialize)]
 struct Template {
     size: Size,
     background: String,
+    source: Option<String>,
     groups: Vec<Group>,
 }
 
@@ -385,29 +413,10 @@ impl GetDimensions for Layer {
     }
 }
 
-impl GroupPosition {
-    fn get_aligned_position(&self, content_size: (u32, u32), container_size: (u32, u32)) -> (u32, u32) {
-        let x = match self.align {
-            Align::Left => self.x,
-            Align::Center => self.x + (container_size.0.saturating_sub(content_size.0)) / 2,
-            Align::Right => self.x + container_size.0.saturating_sub(content_size.0),
-        };
-        (x, self.y)
-    }
-}
-
-impl Position {
-    fn get_aligned_position(&self, _content_size: (u32, u32), _container_size: (u32, u32)) -> (u32, u32) {
-        // For now, we'll just return the absolute position
-        // Relative positioning will be handled at a higher level when we have access to all layer information
-        (self.x, self.y)
-    }
-}
-
 impl Group {
     fn calculate_positions(&self, layers_info: &[(LayerDimensions, &LayerInfo)]) -> Vec<Position> {
         let mut positions = Vec::new();
-        let mut current_x = self.layout.position.x;
+        let current_x = self.layout.position.x;
         let current_y = self.layout.position.y;
 
         // Calculate total dimensions
@@ -466,189 +475,156 @@ impl Group {
             },
         };
 
-        // Apply group alignment
-        if let Some(dist_config) = &self.layout.distribution {
+        // Get container bounds from distribution config or use total dimensions
+        let container_bounds = if let Some(dist_config) = &self.layout.distribution {
             if let Some(bounds) = &dist_config.bounds {
-                let (x, _y) = self.layout.position.get_aligned_position(
-                    (total_width, total_height),
-                    (bounds.width, bounds.height)
-                );
-                current_x = x;
-                // Keep current_y as is since vertical alignment is handled by distribution
+                (bounds.width, bounds.height)
+            } else {
+                (total_width, total_height)
             }
         } else {
-            let (x, _y) = self.layout.position.get_aligned_position(
-                (total_width, total_height),
-                (total_width, total_height) // Use content size as container size when no bounds
-            );
-            current_x = x;
-            // Keep current_y as is for consistency with the original layout
-        }
+            (total_width, total_height)
+        };
 
+        // Apply global alignment
+        let (base_x, base_y) = match self.layout.alignment {
+            GroupAlignment::Left => (current_x, current_y),
+            GroupAlignment::Center => (
+                current_x + (container_bounds.0.saturating_sub(total_width)) / 2,
+                current_y + (container_bounds.1.saturating_sub(total_height)) / 2
+            ),
+            GroupAlignment::Right => (
+                current_x + container_bounds.0.saturating_sub(total_width),
+                current_y
+            ),
+            GroupAlignment::Top => (
+                current_x,
+                current_y
+            ),
+            GroupAlignment::Bottom => (
+                current_x,
+                current_y + container_bounds.1.saturating_sub(total_height)
+            ),
+        };
+
+        // Calculate spacing based on justification
+        let (init_spacing, item_spacing) = match self.layout.justification {
+            GroupJustification::Start => (0, self.layout.spacing),
+            GroupJustification::Center => {
+                let total_space = match self.layout.layout_type {
+                    LayoutType::Horizontal => container_bounds.0.saturating_sub(total_width),
+                    LayoutType::Vertical => container_bounds.1.saturating_sub(total_height),
+                    LayoutType::Grid => 0, // Grid handles spacing differently
+                };
+                (total_space / 2, self.layout.spacing)
+            },
+            GroupJustification::End => {
+                let total_space = match self.layout.layout_type {
+                    LayoutType::Horizontal => container_bounds.0.saturating_sub(total_width),
+                    LayoutType::Vertical => container_bounds.1.saturating_sub(total_height),
+                    LayoutType::Grid => 0,
+                };
+                (total_space, self.layout.spacing)
+            },
+            GroupJustification::SpaceBetween => {
+                let count = layers_info.len().saturating_sub(1).max(1);
+                let total_space = match self.layout.layout_type {
+                    LayoutType::Horizontal => container_bounds.0.saturating_sub(total_width),
+                    LayoutType::Vertical => container_bounds.1.saturating_sub(total_height),
+                    LayoutType::Grid => 0,
+                };
+                (0, total_space / count as u32)
+            },
+            GroupJustification::SpaceAround => {
+                let count = layers_info.len() + 1;
+                let total_space = match self.layout.layout_type {
+                    LayoutType::Horizontal => container_bounds.0.saturating_sub(total_width),
+                    LayoutType::Vertical => container_bounds.1.saturating_sub(total_height),
+                    LayoutType::Grid => 0,
+                };
+                let spacing = total_space / count as u32;
+                (spacing, spacing)
+            },
+            GroupJustification::SpaceEvenly => {
+                let count = layers_info.len() + 2;
+                let total_space = match self.layout.layout_type {
+                    LayoutType::Horizontal => container_bounds.0.saturating_sub(total_width),
+                    LayoutType::Vertical => container_bounds.1.saturating_sub(total_height),
+                    LayoutType::Grid => 0,
+                };
+                let spacing = total_space / count as u32;
+                (spacing, spacing)
+            },
+        };
+
+        // Position elements based on layout type and justification
         match self.layout.layout_type {
             LayoutType::Grid => {
-                if let Some(dist_config) = &self.layout.distribution {
-                    // Calculate grid dimensions
-                    let columns = self.layout.columns as usize;
-                    let rows = (layers_info.len() + columns - 1) / columns;
-                    
-                    // Get distribution bounds or calculate from content
-                    let bounds = dist_config.bounds.as_ref().map(|b| (b.width, b.height)).unwrap_or_else(|| {
-                        let total_width: u32 = layers_info.iter()
-                            .take(columns)
-                            .map(|(dims, _)| dims.width)
-                            .sum();
-                        let total_height: u32 = layers_info.iter()
-                            .step_by(columns)
-                            .take(rows)
-                            .map(|(dims, _)| dims.height)
-                            .sum();
-                        (total_width, total_height)
+                let columns = self.layout.columns as usize;
+                let mut x = base_x;
+                let mut y = base_y;
+                let mut col = 0;
+
+                for (dims, _) in layers_info {
+                    positions.push(Position {
+                        x,
+                        y,
+                        relative_to: RelativeTo::Canvas,
                     });
 
-                    // Calculate spacing
-                    let h_spacing = match dist_config.horizontal {
-                        Some(Distribution::SpaceBetween) => {
-                            let content_width: u32 = layers_info.iter()
-                                .take(columns)
-                                .map(|(dims, _)| dims.width)
-                                .sum();
-                            if columns > 1 {
-                                (bounds.0.saturating_sub(content_width)) / (columns as u32 - 1)
-                            } else {
-                                0
-                            }
-                        },
-                        Some(Distribution::SpaceAround) => {
-                            let content_width: u32 = layers_info.iter()
-                                .take(columns)
-                                .map(|(dims, _)| dims.width)
-                                .sum();
-                            bounds.0.saturating_sub(content_width) / (columns as u32 + 1)
-                        },
-                        Some(Distribution::SpaceEvenly) => {
-                            let content_width: u32 = layers_info.iter()
-                                .take(columns)
-                                .map(|(dims, _)| dims.width)
-                                .sum();
-                            bounds.0.saturating_sub(content_width) / ((columns + 1) as u32)
-                        },
-                        None => self.layout.spacing,
-                    };
-
-                    let v_spacing = match dist_config.vertical {
-                        Some(Distribution::SpaceBetween) => {
-                            let content_height: u32 = layers_info.iter()
-                                .step_by(columns)
-                                .take(rows)
-                                .map(|(dims, _)| dims.height)
-                                .sum();
-                            if rows > 1 {
-                                (bounds.1.saturating_sub(content_height)) / (rows as u32 - 1)
-                            } else {
-                                0
-                            }
-                        },
-                        Some(Distribution::SpaceAround) => {
-                            let content_height: u32 = layers_info.iter()
-                                .step_by(columns)
-                                .take(rows)
-                                .map(|(dims, _)| dims.height)
-                                .sum();
-                            bounds.1.saturating_sub(content_height) / (rows as u32 + 1)
-                        },
-                        Some(Distribution::SpaceEvenly) => {
-                            let content_height: u32 = layers_info.iter()
-                                .step_by(columns)
-                                .take(rows)
-                                .map(|(dims, _)| dims.height)
-                                .sum();
-                            bounds.1.saturating_sub(content_height) / ((rows + 1) as u32)
-                        },
-                        None => self.layout.spacing,
-                    };
-
-                    // Initial offset for space_around and space_evenly
-                    let init_x = match dist_config.horizontal {
-                        Some(Distribution::SpaceAround) | Some(Distribution::SpaceEvenly) => h_spacing,
-                        _ => 0,
-                    };
-                    let init_y = match dist_config.vertical {
-                        Some(Distribution::SpaceAround) | Some(Distribution::SpaceEvenly) => v_spacing,
-                        _ => 0,
-                    };
-
-                    // Position elements
-                    let mut x = current_x + init_x;
-                    let mut y = current_y + init_y;
-                    let mut col = 0;
-
-                    for (dims, _) in layers_info {
-                        positions.push(Position {
-                            x,
-                            y,
-                            relative_to: RelativeTo::Canvas,
-                        });
-
-                        col += 1;
-                        if col >= columns {
-                            // Move to next row
-                            col = 0;
-                            x = current_x + init_x;
-                            y += dims.height + v_spacing;
-                        } else {
-                            x += dims.width + h_spacing;
-                        }
-                    }
-                } else {
-                    // Fallback to original grid layout
-                    let columns = self.layout.columns as usize;
-                    let spacing = self.layout.spacing;
-                    
-                    for (i, (dims, _)) in layers_info.iter().enumerate() {
-                        let row = i / columns;
-                        let col = i % columns;
-                        
-                        let x = current_x + col as u32 * (dims.width + spacing);
-                        let y = current_y + row as u32 * (dims.height + spacing);
-                        
-                        positions.push(Position {
-                            x,
-                            y,
-                            relative_to: RelativeTo::Canvas,
-                        });
+                    col += 1;
+                    if col >= columns {
+                        // Move to next row
+                        col = 0;
+                        x = base_x;
+                        y += dims.height + item_spacing;
+                    } else {
+                        x += dims.width + item_spacing;
                     }
                 }
             },
             LayoutType::Vertical => {
-                let mut y_offset = 0;
+                let mut y = base_y + init_spacing;
                 for (dims, _) in layers_info {
+                    let x = match self.layout.alignment {
+                        GroupAlignment::Left => base_x,
+                        GroupAlignment::Center => base_x + (container_bounds.0.saturating_sub(dims.width)) / 2,
+                        GroupAlignment::Right => base_x + container_bounds.0.saturating_sub(dims.width),
+                        _ => base_x,
+                    };
+
                     positions.push(Position {
-                        x: current_x,
-                        y: current_y + y_offset,
+                        x,
+                        y,
                         relative_to: RelativeTo::Canvas,
                     });
-                    y_offset += dims.height + self.layout.spacing;
+                    y += dims.height + item_spacing;
                 }
             },
             LayoutType::Horizontal => {
-                let mut x_offset = 0;
+                let mut x = base_x + init_spacing;
                 for (dims, _) in layers_info {
+                    let y = match self.layout.alignment {
+                        GroupAlignment::Top => base_y,
+                        GroupAlignment::Center => base_y + (container_bounds.1.saturating_sub(dims.height)) / 2,
+                        GroupAlignment::Bottom => base_y + container_bounds.1.saturating_sub(dims.height),
+                        _ => base_y,
+                    };
+
                     positions.push(Position {
-                        x: current_x + x_offset,
-                        y: current_y,
+                        x,
+                        y,
                         relative_to: RelativeTo::Canvas,
                     });
-                    x_offset += dims.width + self.layout.spacing;
+                    x += dims.width + item_spacing;
                 }
             },
         }
 
-        // Apply individual layer alignments
+        // Handle relative positioning
         let mut relative_adjustments = Vec::new();
         for (i, pos) in positions.iter().enumerate() {
             if let RelativeTo::Layer(ref layer_name) = pos.relative_to {
-                // Find the referenced layer's position
                 if let Some((ref_idx, _)) = layers_info.iter()
                     .enumerate()
                     .find(|(_, (_, info))| info.name == *layer_name)
@@ -658,7 +634,6 @@ impl Group {
             }
         }
 
-        // Apply relative positioning
         for (target_idx, ref_idx) in relative_adjustments {
             let ref_pos = positions[ref_idx].clone();
             positions[target_idx].x = ref_pos.x;
@@ -669,7 +644,7 @@ impl Group {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct TextLayer {
     #[serde(rename = "type")]
     layer_type: String,
@@ -700,6 +675,118 @@ impl TextLayer {
         
         Ok(())
     }
+
+    fn draw(&self, canvas: &mut RgbaImage, position: &Position) -> Result<(), Box<dyn std::error::Error>> {
+        let font = self.font.load_font()?;
+        let text_color = parse_color(&self.font.color)?;
+        let rgba_color = Rgba([
+            (text_color.r * 255.0) as u8,
+            (text_color.g * 255.0) as u8,
+            (text_color.b * 255.0) as u8,
+            (text_color.a * 255.0) as u8,
+        ]);
+        let scale = Scale::uniform(self.font.size);
+        let v_metrics = font.v_metrics(scale);
+
+        // Calculate text dimensions
+        let text = self.text.replace("{{name}}", "World");
+        let glyphs: Vec<_> = font
+            .layout(&text, scale, rusttype::point(0.0, 0.0))
+            .collect();
+        
+        let text_width = glyphs
+            .iter()
+            .filter_map(|g| g.pixel_bounding_box())
+            .fold(0, |acc, bbox| acc + bbox.width()) as u32;
+
+        let text_height = glyphs
+            .iter()
+            .filter_map(|g| g.pixel_bounding_box())
+            .fold(0, |acc, bbox| acc.max(bbox.height())) as u32;
+
+        let x_position = match self.alignment {
+            TextAlignment::Center => position.x.saturating_sub(text_width / 2),
+            TextAlignment::Right => position.x.saturating_sub(text_width),
+            TextAlignment::Left => position.x,
+        };
+
+        // Apply justification spacing
+        let justified_spacing = match self.justification {
+            TextJustification::Justify => {
+                let words = text.split_whitespace().count();
+                if words > 1 {
+                    Some((canvas.width() - text_width) as f32 / (words - 1) as f32)
+                } else {
+                    None
+                }
+            },
+            _ => None,
+        };
+
+        // Layout the text with justification if needed
+        let mut current_x = x_position as f32;
+        let y_position = position.y;
+        let words: Vec<_> = text.split_whitespace().collect();
+        
+        for (i, word) in words.iter().enumerate() {
+            let glyphs: Vec<_> = font
+                .layout(
+                    word,
+                    scale,
+                    rusttype::point(current_x, y_position as f32 + v_metrics.ascent),
+                )
+                .collect();
+
+            // Get word dimensions for decoration
+            let word_width = glyphs
+                .iter()
+                .filter_map(|g| g.pixel_bounding_box())
+                .fold(0, |acc, bbox| acc + bbox.width()) as u32;
+
+            // Draw the word
+            for glyph in glyphs {
+                if let Some(bounding_box) = glyph.pixel_bounding_box() {
+                    glyph.draw(|x, y, v| {
+                        let x = (x as i32 + bounding_box.min.x) as u32;
+                        let y = (y as i32 + bounding_box.min.y) as u32;
+                        if x < canvas.width() && y < canvas.height() {
+                            canvas.put_pixel(
+                                x,
+                                y,
+                                Rgba([
+                                    rgba_color[0],
+                                    rgba_color[1],
+                                    rgba_color[2],
+                                    ((rgba_color[3] as f32) * v) as u8,
+                                ]),
+                            );
+                        }
+                    });
+                }
+            }
+
+            // Draw decoration for this word
+            self.font.draw_decoration(
+                canvas,
+                rgba_color,
+                current_x as u32,
+                position.y,
+                word_width,
+                text_height,
+            );
+
+            // Update x position for next word
+            if i < words.len() - 1 {
+                current_x += word_width as f32 + if let Some(spacing) = justified_spacing {
+                    spacing
+                } else {
+                    scale.x // default space width
+                };
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -728,6 +815,26 @@ impl ImageLayer {
         
         Ok(())
     }
+
+    fn draw(&self, canvas: &mut RgbaImage, position: &Position) -> Result<(), Box<dyn std::error::Error>> {
+        let mut overlay = image::open(&self.source)?;
+        
+        // Apply scaling if needed
+        if self.scale != 1.0 {
+            let new_width = (overlay.width() as f32 * self.scale) as u32;
+            let new_height = (overlay.height() as f32 * self.scale) as u32;
+            overlay = overlay.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+        }
+
+        image::imageops::overlay(
+            canvas,
+            &overlay,
+            position.x as i64,
+            position.y as i64,
+        );
+
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -737,194 +844,142 @@ enum Layer {
     Image(ImageLayer),
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create output directory if it doesn't exist
-    std::fs::create_dir_all("output")?;
-
-    // Load and parse the template
-    let mut template_file = File::open("templates/example.json")?;
-    let mut template_contents = String::new();
-    template_file.read_to_string(&mut template_contents)?;
-    let template: Template = serde_json::from_str(&template_contents)?;
-
-    // Create canvas
-    let mut canvas = RgbaImage::new(template.size.width, template.size.height);
-    
-    // Fill background with specified color
-    let bg_color = parse_color(&template.background)?;
-    for pixel in canvas.pixels_mut() {
-        *pixel = Rgba([
+impl Template {
+    fn process(&self) -> Result<RgbaImage, Box<dyn std::error::Error>> {
+        println!("Processing template");
+        // Create a new image with the specified size and background color
+        let mut canvas = RgbaImage::new(self.size.width, self.size.height);
+        let bg_color = parse_color(&self.background)?;
+        let bg_rgba = Rgba([
             (bg_color.r * 255.0) as u8,
             (bg_color.g * 255.0) as u8,
             (bg_color.b * 255.0) as u8,
             (bg_color.a * 255.0) as u8,
         ]);
-    }
 
-    // Process each group
-    for group in template.groups {
-        // First pass: calculate dimensions for all layers in group
-        let mut layer_info = Vec::new();
-        for layer in &group.layers {
-            let dims = layer.get_dimensions()?;
-            let info = match layer {
-                Layer::Text(text_layer) => &text_layer.info,
-                Layer::Image(image_layer) => &image_layer.info,
-            };
-            layer_info.push((dims, info));
+        // Fill background
+        for pixel in canvas.pixels_mut() {
+            *pixel = bg_rgba;
         }
 
-        // Calculate positions for all layers in group
-        let positions = group.calculate_positions(&layer_info);
+        // Load source file if specified
+        let source_data = if let Some(source) = &self.source {
+            println!("Loading source file: {}", source);
+            if source.ends_with(".ai") {
+                match AiData::new(source, Some(source)) {
+                    Ok(data) => {
+                        println!("Successfully loaded source file");
+                        Some(SourceData::Ai(data))
+                    }
+                    Err(e) => {
+                        println!("Error loading source file: {:?}", e);
+                        return Err(format!("Failed to load source file: {}", e).into());
+                    }
+                }
+            } else {
+                return Err(format!("Unsupported source file type: {}", source).into());
+            }
+        } else {
+            None
+        };
 
-        // Second pass: render layers with calculated positions
-        for (layer, position) in group.layers.into_iter().zip(positions) {
-            match layer {
-                Layer::Text(mut text_layer) => {
-                    text_layer.info.position = Some(position);
-                    println!("Processing text layer: {}", text_layer.info.name);
-                    text_layer.validate()?;
+        // If we have a source file, validate that all required layers exist
+        if let Some(ref source) = source_data {
+            // Collect all text layer names that need to be found in the source
+            let required_layer_names: Vec<String> = self.groups.iter()
+                .flat_map(|group| &group.layers)
+                .filter_map(|layer| {
+                    if let Layer::Text(text) = layer {
+                        Some(text.info.name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
-                    // Load font from system
-                    let font = text_layer.font.load_font()?;
-                    let text_color = parse_color(&text_layer.font.color)?;
-                    let rgba_color = Rgba([
-                        (text_color.r * 255.0) as u8,
-                        (text_color.g * 255.0) as u8,
-                        (text_color.b * 255.0) as u8,
-                        (text_color.a * 255.0) as u8,
-                    ]);
-                    let scale = Scale::uniform(text_layer.font.size);
-                    let v_metrics = font.v_metrics(scale);
+            // Check each required layer exists in the source
+            for layer_name in &required_layer_names {
+                let layer_exists = match source {
+                    SourceData::Ai(ai) => ai.get_layer_by_name(layer_name).is_some(),
+                };
+                if !layer_exists {
+                    return Err(format!("Required layer '{}' not found in source file", layer_name).into());
+                }
+            }
+        }
 
-                    // Calculate text dimensions
-                    let text = text_layer.text.replace("{{name}}", "World");
-                    let glyphs: Vec<_> = font
-                        .layout(&text, scale, rusttype::point(0.0, 0.0))
-                        .collect();
-                    
-                    let text_width = glyphs
-                        .iter()
-                        .filter_map(|g| g.pixel_bounding_box())
-                        .fold(0, |acc, bbox| acc + bbox.width()) as u32;
+        // Process each group
+        for group in &self.groups {
+            let mut layer_dimensions = Vec::new();
+            
+            // Calculate dimensions for each layer
+            for layer in &group.layers {
+                let dimensions = layer.get_dimensions()?;
+                let layer_info = match layer {
+                    Layer::Text(text) => &text.info,
+                    Layer::Image(image) => &image.info,
+                };
+                layer_dimensions.push((dimensions, layer_info));
+            }
 
-                    let text_height = glyphs
-                        .iter()
-                        .filter_map(|g| g.pixel_bounding_box())
-                        .fold(0, |acc, bbox| acc.max(bbox.height())) as u32;
+            // Calculate positions for all layers in the group
+            let positions = group.calculate_positions(&layer_dimensions);
 
-                    let x_position = match text_layer.alignment {
-                        TextAlignment::Center => text_layer.info.position.as_ref().map_or(0, |p| p.x.saturating_sub(text_width / 2)),
-                        TextAlignment::Right => text_layer.info.position.as_ref().map_or(0, |p| p.x.saturating_sub(text_width)),
-                        TextAlignment::Left => text_layer.info.position.as_ref().map_or(0, |p| p.x),
-                    };
-
-                    // Apply justification spacing
-                    let justified_spacing = match text_layer.justification {
-                        TextJustification::Justify => {
-                            let words = text.split_whitespace().count();
-                            if words > 1 {
-                                Some((template.size.width - text_width) as f32 / (words - 1) as f32)
-                            } else {
-                                None
-                            }
-                        },
-                        _ => None,
-                    };
-
-                    // Layout the text with justification if needed
-                    let mut current_x = x_position as f32;
-                    let y_position = text_layer.info.position.as_ref().map_or(0, |p| p.y);
-                    let words: Vec<_> = text.split_whitespace().collect();
-                    
-                    for (i, word) in words.iter().enumerate() {
-                        let glyphs: Vec<_> = font
-                            .layout(
-                                word,
-                                scale,
-                                rusttype::point(current_x, y_position as f32 + v_metrics.ascent),
-                            )
-                            .collect();
-
-                        // Get word dimensions for decoration
-                        let word_width = glyphs
-                            .iter()
-                            .filter_map(|g| g.pixel_bounding_box())
-                            .fold(0, |acc, bbox| acc + bbox.width()) as u32;
-
-                        // Draw the word
-                        for glyph in glyphs {
-                            if let Some(bounding_box) = glyph.pixel_bounding_box() {
-                                glyph.draw(|x, y, v| {
-                                    let x = (x as i32 + bounding_box.min.x) as u32;
-                                    let y = (y as i32 + bounding_box.min.y) as u32;
-                                    if x < canvas.width() && y < canvas.height() {
-                                        canvas.put_pixel(
-                                            x,
-                                            y,
-                                            Rgba([
-                                                rgba_color[0],
-                                                rgba_color[1],
-                                                rgba_color[2],
-                                                ((rgba_color[3] as f32) * v) as u8,
-                                            ]),
-                                        );
-                                    }
-                                });
-                            }
-                        }
-
-                        // Draw decoration for this word
-                        if let Some(pos) = &text_layer.info.position {
-                            text_layer.font.draw_decoration(
-                                &mut canvas,
-                                rgba_color,
-                                current_x as u32,
-                                pos.y,
-                                word_width,
-                                text_height,
-                            );
-                        }
-
-                        // Update x position for next word
-                        if i < words.len() - 1 {
-                            current_x += word_width as f32 + if let Some(spacing) = justified_spacing {
-                                spacing
-                            } else {
-                                scale.x // default space width
+            // Draw each layer
+            for (layer, position) in group.layers.iter().zip(positions.iter()) {
+                match layer {
+                    Layer::Text(text) => {
+                        let mut modified_text = text.clone();
+                        
+                        // Try to get text content from source file
+                        if let Some(ref source) = source_data {
+                            let source_layer = match source {
+                                SourceData::Ai(ai) => ai.get_layer_by_name(&text.info.name),
                             };
+                            if source_layer.is_none() {
+                                return Err(format!("Required layer '{}' not found in source file", text.info.name).into());
+                            }
                         }
-                    }
-                },
-                Layer::Image(mut image_layer) => {
-                    image_layer.info.position = Some(position);
-                    println!("Processing image layer: {}", image_layer.info.name);
-                    image_layer.validate()?;
 
-                    let mut overlay = image::open(&image_layer.source)?;
-                    
-                    // Apply scaling if needed
-                    if image_layer.scale != 1.0 {
-                        let new_width = (overlay.width() as f32 * image_layer.scale) as u32;
-                        let new_height = (overlay.height() as f32 * image_layer.scale) as u32;
-                        overlay = overlay.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+                        modified_text.draw(&mut canvas, position)?;
                     }
-
-                    if let Some(pos) = &image_layer.info.position {
-                        image::imageops::overlay(
-                            &mut canvas,
-                            &overlay,
-                            pos.x as i64,
-                            pos.y as i64,
-                        );
+                    Layer::Image(image) => {
+                        image.draw(&mut canvas, position)?;
                     }
                 }
             }
         }
+
+        Ok(canvas)
     }
+}
+
+enum SourceData {
+    Ai(AiData),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TemplateLayer {
+    Text(TextLayer),
+    Image(ImageLayer),
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create output directory if it doesn't exist
+    std::fs::create_dir_all("output")?;
+
+    // Load and parse the template
+    let mut template_file = File::open("templates/ai.json")?;
+    let mut template_contents = String::new();
+    template_file.read_to_string(&mut template_contents)?;
+    let template: Template = serde_json::from_str(&template_contents)?;
+
+    // Process the template
+    let result_image = template.process()?;
 
     // Save the result
-    canvas.save("output/result.png")?;
+    result_image.save("output/result.png")?;
     println!("Image has been created successfully in output/result.png!");
     
     Ok(())

@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+psd = "0.3"
+pdf-extract = "0.7"
 image = "0.24"
-rusttype = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+rusttype = "0.9"
 csscolorparser = "0.6"
 font-kit = "0.11"
+lopdf = "0.31.0"
 

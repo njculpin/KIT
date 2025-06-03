@@ -1,6 +1,7 @@
 {
     "size": { "width": 3600, "height": 4800 },
     "background": "#FFFFFF",
+    "source": "assets/city.ai",
     "groups": [
         {
             "name": "header",
@@ -9,15 +10,14 @@
                 "spacing": 20,
                 "position": {
                     "x": 1800,
-                    "y": 50,
-                    "align": "center"
+                    "y": 50
                 }
             },
             "layers": [
                 {
                     "type": "text",
-                    "name": "Title",
-                    "text": "Hello Muffin",
+                    "name": "CITY",
+                    "text": "NEW YORK",
                     "font": { 
                         "family": "Arial",
                         "size": 120,
@@ -30,10 +30,19 @@
                     "justification": "center"
                 },
                 {
-                    "type": "image",
-                    "name": "Logo",
-                    "source": "assets/cat.png",
-                    "scale": 1.5
+                    "type": "text",
+                    "name": "STATE",
+                    "text": "NY",
+                    "font": { 
+                        "family": "Arial",
+                        "size": 120,
+                        "color": "#FF0000",
+                        "weight": "bold",
+                        "style": "normal",
+                        "decoration": "none"
+                    },
+                    "alignment": "center",
+                    "justification": "center"
                 }
             ]
         }
